@@ -2,6 +2,7 @@ const express = require('express');
 const https = require('https');
 const fs = require('fs');
 const { createClient } = require('@supabase/supabase-js');
+const { AndroidFCM, Client: PushReceiverClient } = require('@liamcottle/push-receiver');
 const dotenv = require('dotenv');
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
@@ -354,24 +355,24 @@ app.post('/pair-with-server', async (req, res) => {
 
 async function startMonitoring(SteamID, PlayerToken) {
 
-    if (activeMonitors.has(steamId)) {
-            const monitor = activeMonitors.get(steamId);
+    if (activeMonitors.has(SteamID)) {
+            const monitor = activeMonitors.get(SteamID);
             
             if (Date.now() - monitor.lastActive < 300000) {
-                console.log(`Monitor for ${steamId} is already active, skipping registration`);
+                console.log(`Monitor for ${SteamID} is already active, skipping registration`);
                 return;
             }
             
-            console.log(`Cleaning up old monitor for ${steamId}`);
+            console.log(`Cleaning up old monitor for ${SteamID}`);
             try {
                 await monitor.fcmClient.destroy();
             } catch (cleanupError) {
-                console.error(`Error cleaning up old monitor for ${steamId}:`, cleanupError);
+                console.error(`Error cleaning up old monitor for ${SteamID}:`, cleanupError);
             }
-            activeMonitors.delete(steamId);
+            activeMonitors.delete(SteamID);
     }
 
-    console.log(`Starting new monitor for ${steamId}`);
+    console.log(`Starting new monitor for ${SteamID}`);
 
     const credentials = await registerDevice();
     if (!credentials) {
@@ -380,7 +381,7 @@ async function startMonitoring(SteamID, PlayerToken) {
 
     const expoPushToken = await getExpoPushToken(credentials.fcm.token);
 
-    console.log(`Got Expo token for ${steamId}:`, expoPushToken);
+    console.log(`Got Expo token for ${SteamID}:`, expoPushToken);
     
     let retryCount = 0;
     const maxRetries = 3;
@@ -388,14 +389,14 @@ async function startMonitoring(SteamID, PlayerToken) {
     
     while (retryCount < maxRetries) {
         try {
-            await registerWithRustPlus(playerToken, expoPushToken);
-            console.log(`Successfully registered ${steamId} with Rust+`);
+            await registerWithRustPlus(PlayerToken, expoPushToken);
+            console.log(`Successfully registered ${SteamID} with Rust+`);
             break;
         } catch (error) {
             lastError = error;
             retryCount++;
             if (retryCount < maxRetries) {
-                console.log(`Retry attempt ${retryCount} for ${steamId}`);
+                console.log(`Retry attempt ${retryCount} for ${SteamID}`);
                 await new Promise(resolve => setTimeout(resolve, 2000));
             }
         }
@@ -411,18 +412,34 @@ async function startMonitoring(SteamID, PlayerToken) {
         []
     );
     
-    activeMonitors.set(steamId, {
+    let pairingTimeout;
+    let pairingFound = false;
+    
+    pairingTimeout = setTimeout(() => {
+        if (!pairingFound) {
+            console.log(`Pairing timeout reached for ${SteamID} - stopping monitor`);
+            try {
+                fcmClient.destroy();
+                activeMonitors.delete(SteamID);
+            } catch (error) {
+                console.error(`Error cleaning up timed out monitor for ${SteamID}:`, error);
+            }
+        }
+    }, 60000);
+    
+    activeMonitors.set(SteamID, {
         fcmClient,
         expoToken: expoPushToken,
         credentials,
-        lastActive: Date.now()
+        lastActive: Date.now(),
+        pairingTimeout: pairingTimeout
     });
 
     fcmClient.on('ON_DATA_RECEIVED', async (data) => {
         const timestamp = new Date().toLocaleString();
-        console.log(`[${timestamp}] Notification for ${steamId}:`, data);
+        console.log(`[${timestamp}] Notification for ${SteamID}:`, data);
 
-        const monitor = activeMonitors.get(steamId);
+        const monitor = activeMonitors.get(SteamID);
         if (monitor) {
             monitor.lastActive = Date.now();
         }
@@ -433,12 +450,17 @@ async function startMonitoring(SteamID, PlayerToken) {
             const bodyData = data.appData.find(item => item.key === 'body')?.value;
 
             if (messageData === 'Tap to pair with this server.') {
+                if (pairingTimeout) {
+                    clearTimeout(pairingTimeout);
+                    pairingFound = true;
+                }
+                
                 const serverData = JSON.parse(bodyData);
 
                 const { error } = await supabase
                     .from('discord_servers')
                     .upsert({
-                        steamid: steamId,
+                        steamid: SteamID,
                         name: serverData.name,
                         status: 'WAITING FOR SMART ALARM',
                         triggers: '0',
@@ -451,9 +473,38 @@ async function startMonitoring(SteamID, PlayerToken) {
                     console.log('Logging server: ', serverData.name)
                 }
             }
+            else if(titleData === 'Smart Alarm' && messageData === 'Tap to pair with this device.') {
+                
+                const { error } = await supabase
+                    .from('discord_servers')
+                    .update({
+                        status: 'connected'
+                    })
+                    .eq('steamid', SteamID);
+
+                if (error) {
+                    console.log(error)
+                }
+            }
+            else if (messageData === 'Your base is under attack!') {
+
+                const { error } = await supabase
+                    .from('discord_servers')
+                    .update({
+                        status: 'triggered'
+                    })
+                    .eq('steamid', SteamID);
+
+                if (error) {
+                    console.log(error)
+                }
+            }
         }
 
     });
+
+    await fcmClient.connect();
+    console.log(`Monitor active for ${SteamID} - will timeout in 1 minute if no pairing`);
 
 }
 
@@ -615,6 +666,41 @@ app.post('/check-steamid', async (req, res) => {
     } catch (error) {
         console.log(error)
     }
+
+});
+
+app.post('/server-stats', async (req, res) => {
+    try {
+        const { SteamID } = req.body;
+
+        const { data, error } = await supabase
+            .from('discord_servers')
+            .select('*')
+            .eq('steamid', SteamID)
+            .single();
+
+        if (error) {
+            console.error('No row found for steamid: ', error);
+            return res.status(404).json({ 
+            success: false, 
+            error: 'No server row found for steamid'
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            name: data.name,
+            alarmStatus: data.status,
+            triggers: data.triggers,
+            triggerTime: data.lastcall,
+        })
+
+        
+        
+    } catch (error) {
+        console.log(error)
+    }
+
 
 });
 
