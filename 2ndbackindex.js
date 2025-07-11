@@ -634,7 +634,7 @@ app.post('/check-steamid', async (req, res) => {
                 .eq('steamid', SteamID)
                 .maybeSingle();
 
-            const success = data.length > 0;
+            const success = !!data;
 
             res.json({
                 success
@@ -652,7 +652,7 @@ app.post('/check-steamid', async (req, res) => {
                 .eq('steamid', SteamID)
                 .maybeSingle();
 
-            const success = data.length > 0;
+            const success = !!data;
 
             res.json({
                 success
@@ -695,13 +695,38 @@ app.post('/server-stats', async (req, res) => {
             triggerTime: data.lastcall,
         })
 
-        
-        
     } catch (error) {
         console.log(error)
     }
+});
 
+app.post('/player-token', async (req, res) => {
+    try {
+        const { SteamID } = req.body;
 
+        const { data, error } = await supabase
+            .from('discord_tokens')
+            .select('*')
+            .eq('steamid', SteamID)
+            .single();
+
+        if (error) {
+            console.error('No row found for steamid: ', error);
+            return res.status(404).json({ 
+            success: false, 
+            error: 'No token row found for steamid'
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            steamid: data.steamid,
+            token: data.token
+        })
+
+    } catch (error) {
+        console.log(error)
+    }
 });
 
 
